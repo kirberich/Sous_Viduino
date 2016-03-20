@@ -1,20 +1,11 @@
 //-------------------------------------------------------------------
-//
-// Sous Vide Controller
-// Bill Earl - for Adafruit Industries
-//
-// Based on the Arduino PID and PID AutoTune Libraries 
-// by Brett Beauregard
+// Based on Adafruit's Sous_Viduino
+// Adapted to work with an OLED screen
 //------------------------------------------------------------------
 
 // PID Library
 #include <PID_v1.h>
 #include <PID_AutoTune_v0.h>
-
-// Libraries for the Adafruit RGB/LCD Shield
-#include <Wire.h>
-#include <Adafruit_MCP23017.h>
-#include <Adafruit_RGBLCDShield.h>
 
 // Libraries for the DS18B20 Temperature Sensor
 #include <OneWire.h>
@@ -23,737 +14,386 @@
 // So we can save and retrieve settings
 #include <EEPROM.h>
 
+// Display
+#include <U8glib.h>
+#include <u8g_ui.h>
+
+// Timer
+#include <TimerOne.h>
+
 // ************************************************
 // Pin definitions
 // ************************************************
 
+// Button pins
+#define UP_PIN 10
+#define DOWN_PIN 11
+#define SELECT_PIN 12
+#define BYPASS_PIN 13
+
 // Output Relay
-#define RelayPin 7
+#define RELAY_PIN 2
 
 // One-Wire Temperature Sensor
 // (Use GPIO pins for power/ground to simplify the wiring)
-#define ONE_WIRE_BUS 2
-#define ONE_WIRE_PWR 3
-#define ONE_WIRE_GND 4
+
+#define ONE_WIRE_GND 5
+#define ONE_WIRE_PWR 6
+#define ONE_WIRE_BUS 7
 
 // ************************************************
 // PID Variables and constants
 // ************************************************
 
-//Define Variables we'll be connecting to
-double Setpoint;
-double Input;
-double Output;
+// Define Variables we'll be connecting to
+double setpoint;
+double input = 0;
+double output;
+bool is_on = false;
+bool is_on_selection = false;
+int turn_on_delay;
+int turn_off_delay;
+unsigned long started_cooking_at = 0;
+unsigned long turn_on_at;
+unsigned long turn_off_at;
 
-volatile long onTime = 0;
+// Temperature history
+#define HISTORY_LEN 60
+byte short_term_history[HISTORY_LEN];
+unsigned long last_short_term_update;
+volatile long on_time = 0;
 
 // pid tuning parameters
-double Kp;
-double Ki;
-double Kd;
+double kp;
+double ki;
+double kd;
 
 // EEPROM addresses for persisted data
-const int SpAddress = 0;
-const int KpAddress = 8;
-const int KiAddress = 16;
-const int KdAddress = 24;
+const int sp_address = 0;
+const int kp_address = 8;
+const int ki_address = 16;
+const int kd_address = 24;
 
 //Specify the links and initial tuning parameters
-PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+PID pid(&input, &output, &setpoint, kp, ki, kd, DIRECT);
 
-// 10 second Time Proportional Output window
-int WindowSize = 10000; 
-unsigned long windowStartTime;
+// 60 second Time Proportional output window
+unsigned int window_size = 60000; 
+unsigned long window_start_time;
 
 // ************************************************
 // Auto Tune Variables and constants
 // ************************************************
-byte ATuneModeRemember=2;
+byte a_tune_mode_remember = 2;
 
-double aTuneStep=500;
-double aTuneNoise=1;
-unsigned int aTuneLookBack=20;
+double auto_tune_step = 500;
+double auto_tune_noise = 1;
+unsigned int auto_tune_lookback = 20;
 
-boolean tuning = false;
+boolean is_tuning = false;
 
-PID_ATune aTune(&Input, &Output);
-
-// ************************************************
-// DiSplay Variables and constants
-// ************************************************
-
-Adafruit_RGBLCDShield lcd = Adafruit_RGBLCDShield();
-// These #defines make it easy to set the backlight color
-#define RED 0x1
-#define YELLOW 0x3
-#define GREEN 0x2
-#define TEAL 0x6
-#define BLUE 0x4
-#define VIOLET 0x5
-#define WHITE 0x7
-
-#define BUTTON_SHIFT BUTTON_SELECT
-
-unsigned long lastInput = 0; // last button press
-
-byte degree[8] = // define the degree symbol 
-{ 
- B00110, 
- B01001, 
- B01001, 
- B00110, 
- B00000,
- B00000, 
- B00000, 
- B00000 
-}; 
-
-const int logInterval = 10000; // log every 10 seconds
-long lastLogTime = 0;
+PID_ATune a_tune(&input, &output);
 
 // ************************************************
-// States for state machine
+// Display / UI
 // ************************************************
-enum operatingState { OFF = 0, SETP, RUN, TUNE_P, TUNE_I, TUNE_D, AUTO};
-operatingState opState = OFF;
+U8GLIB_SSD1306_128X64 u8g(U8G_I2C_OPT_DEV_0|U8G_I2C_OPT_FAST|U8G_I2C_OPT_NO_ACK);
+
+ToggleItem *on_toggle = new ToggleItem("On");
+RangeItem *turn_on_delay_range = new RangeItem("On After", 0, 1440, 0, 30);
+RangeItem *turn_off_delay_range = new RangeItem("Off After", 0, 2880, 0, 5);
+RangeItem *temperature_range = new RangeItem("Temp", 0, 100, 58, 1);
+
+Item *items[] = {
+	on_toggle,
+	turn_on_delay_range,
+	turn_off_delay_range,
+	temperature_range
+};
+
+Screen *main_screen = new Screen(u8g, items, 4);
+U8G_UI ui = U8G_UI(main_screen, UP_PIN, DOWN_PIN, SELECT_PIN);
 
 // ************************************************
 // Sensor Variables and constants
-// Data wire is plugged into port 2 on the Arduino
+// Setup a OneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
+// ************************************************
+OneWire one_wire(ONE_WIRE_BUS);
 
-// Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
-OneWire oneWire(ONE_WIRE_BUS);
-
-// Pass our oneWire reference to Dallas Temperature. 
-DallasTemperature sensors(&oneWire);
+// Pass our one_wire reference to Dallas Temperature. 
+DallasTemperature sensors(&one_wire);
 
 // arrays to hold device address
-DeviceAddress tempSensor;
+DeviceAddress temp_sensor;
 
-// ************************************************
-// Setup and diSplay initial screen
-// ************************************************
-void setup()
-{
-   Serial.begin(9600);
-
-   // Initialize Relay Control:
-
-   pinMode(RelayPin, OUTPUT);    // Output mode to drive relay
-   digitalWrite(RelayPin, LOW);  // make sure it is off to start
-
-   // Set up Ground & Power for the sensor from GPIO pins
-
-   pinMode(ONE_WIRE_GND, OUTPUT);
-   digitalWrite(ONE_WIRE_GND, LOW);
-
-   pinMode(ONE_WIRE_PWR, OUTPUT);
-   digitalWrite(ONE_WIRE_PWR, HIGH);
-
-   // Initialize LCD DiSplay 
-
-   lcd.begin(16, 2);
-   lcd.createChar(1, degree); // create degree symbol from the binary
-   
-   lcd.setBacklight(VIOLET);
-   lcd.print(F("    Adafruit"));
-   lcd.setCursor(0, 1);
-   lcd.print(F("   Sous Vide!"));
-
-   // Start up the DS18B20 One Wire Temperature Sensor
-
-   sensors.begin();
-   if (!sensors.getAddress(tempSensor, 0)) 
-   {
-      lcd.setCursor(0, 1);
-      lcd.print(F("Sensor Error"));
-   }
-   sensors.setResolution(tempSensor, 12);
-   sensors.setWaitForConversion(false);
-
-   delay(3000);  // Splash screen
-
-   // Initialize the PID and related variables
-   LoadParameters();
-   myPID.SetTunings(Kp,Ki,Kd);
-
-   myPID.SetSampleTime(1000);
-   myPID.SetOutputLimits(0, WindowSize);
-
-  // Run timer2 interrupt every 15 ms 
-  TCCR2A = 0;
-  TCCR2B = 1<<CS22 | 1<<CS21 | 1<<CS20;
-
-  //Timer2 Overflow Interrupt Enable
-  TIMSK2 |= 1<<TOIE2;
+void timer_isr() {
+	// Timer Interrupt Handler
+	ui.handle_input();
+	if (is_on) {
+		drive_output();
+	}
 }
 
-// ************************************************
-// Timer Interrupt Handler
-// ************************************************
-SIGNAL(TIMER2_OVF_vect) 
-{
-  if (opState == OFF)
-  {
-    digitalWrite(RelayPin, LOW);  // make sure relay is off
-  }
-  else
-  {
-    DriveOutput();
-  }
+void setup() {
+	// Initialize Relay Control:
+	pinMode(RELAY_PIN, OUTPUT);    // output mode to drive relay
+
+	// Set up Ground & Power for the sensor from GPIO pins
+	pinMode(ONE_WIRE_GND, OUTPUT);
+	digitalWrite(ONE_WIRE_GND, LOW);
+
+	pinMode(ONE_WIRE_PWR, OUTPUT);
+	digitalWrite(ONE_WIRE_PWR, HIGH);
+
+	pinMode(BYPASS_PIN, INPUT);
+	digitalWrite(BYPASS_PIN, HIGH);
+
+	if (digitalRead(SELECT_PIN) == LOW) {
+		start_auto_tune();
+	}
+
+	// Start up the DS18B20 One Wire Temperature Sensor
+	sensors.begin();
+	sensors.getAddress(temp_sensor, 0);
+	sensors.setResolution(temp_sensor, 12);
+	sensors.setWaitForConversion(false);
+
+	u8g.setFont(u8g_font_6x10);
+	u8g.setFontPosTop();
+
+	// Initialize the PID and related variables
+	load_parameters();
+
+	pid.SetTunings(kp, ki, kd);
+
+	pid.SetSampleTime(1000);
+	pid.SetOutputLimits(0, window_size);
+	pid.SetMode(AUTOMATIC);
+
+	Timer1.initialize(15000); // 15ms timer
+	Timer1.attachInterrupt(timer_isr); // attach the service routine here
 }
 
-// ************************************************
-// Main Control Loop
-//
-// All state changes pass through here
-// ************************************************
-void loop()
-{
-   // wait for button release before changing state
-   while(ReadButtons() != 0) {}
+void update_history() {
+	unsigned long now = millis();
+	if (now - last_short_term_update > 1000) {
+		for (byte i=1; i < HISTORY_LEN; i++) {
+			short_term_history[i-1] = short_term_history[i];
+		}
+		short_term_history[HISTORY_LEN-1] = input;
+		last_short_term_update = now;
+	}
 
-   lcd.clear();
-
-   switch (opState)
-   {
-   case OFF:
-      Off();
-      break;
-   case SETP:
-      Tune_Sp();
-      break;
-    case RUN:
-      Run();
-      break;
-   case TUNE_P:
-      TuneP();
-      break;
-   case TUNE_I:
-      TuneI();
-      break;
-   case TUNE_D:
-      TuneD();
-      break;
-   }
+	// For the long-term history, we'll use the average temperature of the last minute
+	// if (now - last_long_term_update > 3600000) {
+	// 	double short_term_avg = short_term_history[0]/60.0;
+	// 	for (byte i=1; i<60; i++) {
+	// 		short_term_avg += short_term_history[i]/60.0;
+	// 		long_term_history[i-1] = long_term_history[i];
+	// 	}
+	// 	long_term_history[59] = short_term_avg;
+	// 	last_long_term_update = now;
+	// }
 }
 
-// ************************************************
-// Initial State - press RIGHT to enter setpoint
-// ************************************************
-void Off()
-{
-   myPID.SetMode(MANUAL);
-   lcd.setBacklight(0);
-   digitalWrite(RelayPin, LOW);  // make sure it is off
-   lcd.print(F("    Adafruit"));
-   lcd.setCursor(0, 1);
-   lcd.print(F("   Sous Vide!"));
-   uint8_t buttons = 0;
-   
-   while(!(buttons & (BUTTON_RIGHT)))
-   {
-      buttons = ReadButtons();
-   }
-   // Prepare to transition to the RUN state
-   sensors.requestTemperatures(); // Start an asynchronous temperature reading
+void draw_history(byte *history) {
+	// Draw horizontal dotted line for target temperature
+	byte y_pos_setpoint = 73 - round(setpoint / 2.0);
+	for (byte x=0; x < HISTORY_LEN; x+=2) {
+		u8g.drawPixel(x + 35, y_pos_setpoint);
+	}
 
-   //turn the PID on
-   myPID.SetMode(AUTOMATIC);
-   windowStartTime = millis();
-   opState = RUN; // start control
+	// Draw history lines, one line per entry
+	for (byte x=0; x < HISTORY_LEN; x++) {
+		u8g.drawLine(x + 34, 63, x + 34, 73 - round(history[x] / 2.0));
+	}
+
+	byte y_pos_left = min(73 - round(history[0] / 2.0) - 4, 56);
+	byte y_pos_right = min(73 - round(history[59] / 2.0) - 4, 56);
+	main_screen->write(String(int(round(history[0]))), 33, y_pos_left, RIGHT);
+	main_screen->write(String(int(round(history[59]))), 96, y_pos_right, LEFT);
 }
 
-// ************************************************
-// Setpoint Entry State
-// UP/DOWN to change setpoint
-// RIGHT for tuning parameters
-// LEFT for OFF
-// SHIFT for 10x tuning
-// ************************************************
-void Tune_Sp()
-{
-   lcd.setBacklight(TEAL);
-   lcd.print(F("Set Temperature:"));
-   uint8_t buttons = 0;
-   while(true)
-   {
-      buttons = ReadButtons();
+void loop(){
+	u8g.firstPage();
+	do {
+		if (digitalRead(BYPASS_PIN) == LOW) {
+			// Bypass logic - If bypass is on, nothing else happens
+			if (digitalRead(BYPASS_PIN) == LOW) {
+				digitalWrite(RELAY_PIN, LOW);
 
-      float increment = 0.1;
-      if (buttons & BUTTON_SHIFT)
-      {
-        increment *= 10;
-      }
-      if (buttons & BUTTON_LEFT)
-      {
-         opState = RUN;
-         return;
-      }
-      if (buttons & BUTTON_RIGHT)
-      {
-         opState = TUNE_P;
-         return;
-      }
-      if (buttons & BUTTON_UP)
-      {
-         Setpoint += increment;
-         delay(200);
-      }
-      if (buttons & BUTTON_DOWN)
-      {
-         Setpoint -= increment;
-         delay(200);
-      }
-    
-      if ((millis() - lastInput) > 3000)  // return to RUN after 3 seconds idle
-      {
-         opState = RUN;
-         return;
-      }
-      lcd.setCursor(0,1);
-      lcd.print(Setpoint);
-      lcd.print(" ");
-      DoControl();
-   }
+				u8g.setScale2x2(); 
+				main_screen->write("OFF", 32, 12, CENTER);
+				u8g.undoScale();
+				return;
+			}
+		} else if (millis() > ui.last_activity() + 2000) {
+			// Show status screen
+			main_screen->write(String(int(round(input))) + " deg", 64, 0, CENTER);
+			if (is_tuning) {
+				main_screen->write(String(kp) + " " + String(ki) + " " + String(kd), 64, 10, CENTER);
+			}
+			draw_history(short_term_history);
+		} else {
+			ui.update();
+		}
+	} while(u8g.nextPage());
+
+	// Read updated values
+	if (sensors.isConversionAvailable(0)) {
+		input = sensors.getTempC(temp_sensor);
+		sensors.requestTemperatures(); // prime the pump for the next one - but don't wait
+	}
+
+	setpoint = temperature_range->get_value();
+	turn_on_delay = turn_on_delay_range->get_value();
+	turn_off_delay = turn_off_delay_range->get_value();
+
+	// When the on state changes in the menu, turn the cooking off or set the on-delay
+	if (on_toggle->get_value() != is_on_selection) {
+		is_on_selection = on_toggle->get_value();
+
+		if (is_on_selection) {
+			// When on is selected, set the time that the cooking should be started at
+			turn_on_at = millis() + turn_on_delay * 60000;
+		} else {
+			// When off is selected, turn off cooking immediately.
+			is_on = false;
+			on_toggle->name = "On";
+			digitalWrite(RELAY_PIN, HIGH);
+		}
+	}
+
+	// As long as we're waiting for an on-delay to expire (is_on is selected but not yet set)
+	// check if the cooking should start yet
+	if(is_on_selection && !is_on) {
+		if(millis() > turn_on_at) {
+			on_toggle->name = "On";
+			is_on = true;
+			started_cooking_at = millis();
+		} else {
+			on_toggle->name = "On (in " + String(round((turn_on_at - millis())/60000.0)) + " min)";
+		}
+	}
+
+	// Update the turn-off delay - it's relative to the cooking-start time, so we can just update it whenever
+	if (is_on) {
+		turn_off_at = started_cooking_at + turn_off_delay * 60000;
+
+		if (turn_off_delay) {
+			on_toggle->name = "On (for " + String(round((turn_off_at - millis())/60000.0)) + " min)";
+			if (millis() > turn_off_at) {
+				on_toggle->set_value(false);
+			}
+		}
+	}
+
+	update_history();
+
+	pid.SetTunings(kp, ki, kd);
+	do_pid_control();
 }
 
-// ************************************************
-// Proportional Tuning State
-// UP/DOWN to change Kp
-// RIGHT for Ki
-// LEFT for setpoint
-// SHIFT for 10x tuning
-// ************************************************
-void TuneP()
-{
-   lcd.setBacklight(TEAL);
-   lcd.print(F("Set Kp"));
+void do_pid_control() {
+	if (is_tuning) {
+		// run the auto-tuner
+		if (a_tune.Runtime()) { // returns 'true' when done
+			finish_auto_tune();
+		}
+	} else {
+		pid.Compute();
+	}
 
-   uint8_t buttons = 0;
-   while(true)
-   {
-      buttons = ReadButtons();
-
-      float increment = 1.0;
-      if (buttons & BUTTON_SHIFT)
-      {
-        increment *= 10;
-      }
-      if (buttons & BUTTON_LEFT)
-      {
-         opState = SETP;
-         return;
-      }
-      if (buttons & BUTTON_RIGHT)
-      {
-         opState = TUNE_I;
-         return;
-      }
-      if (buttons & BUTTON_UP)
-      {
-         Kp += increment;
-         delay(200);
-      }
-      if (buttons & BUTTON_DOWN)
-      {
-         Kp -= increment;
-         delay(200);
-      }
-      if ((millis() - lastInput) > 3000)  // return to RUN after 3 seconds idle
-      {
-         opState = RUN;
-         return;
-      }
-      lcd.setCursor(0,1);
-      lcd.print(Kp);
-      lcd.print(" ");
-      DoControl();
-   }
-}
-
-// ************************************************
-// Integral Tuning State
-// UP/DOWN to change Ki
-// RIGHT for Kd
-// LEFT for Kp
-// SHIFT for 10x tuning
-// ************************************************
-void TuneI()
-{
-   lcd.setBacklight(TEAL);
-   lcd.print(F("Set Ki"));
-
-   uint8_t buttons = 0;
-   while(true)
-   {
-      buttons = ReadButtons();
-
-      float increment = 0.01;
-      if (buttons & BUTTON_SHIFT)
-      {
-        increment *= 10;
-      }
-      if (buttons & BUTTON_LEFT)
-      {
-         opState = TUNE_P;
-         return;
-      }
-      if (buttons & BUTTON_RIGHT)
-      {
-         opState = TUNE_D;
-         return;
-      }
-      if (buttons & BUTTON_UP)
-      {
-         Ki += increment;
-         delay(200);
-      }
-      if (buttons & BUTTON_DOWN)
-      {
-         Ki -= increment;
-         delay(200);
-      }
-      if ((millis() - lastInput) > 3000)  // return to RUN after 3 seconds idle
-      {
-         opState = RUN;
-         return;
-      }
-      lcd.setCursor(0,1);
-      lcd.print(Ki);
-      lcd.print(" ");
-      DoControl();
-   }
-}
-
-// ************************************************
-// Derivative Tuning State
-// UP/DOWN to change Kd
-// RIGHT for setpoint
-// LEFT for Ki
-// SHIFT for 10x tuning
-// ************************************************
-void TuneD()
-{
-   lcd.setBacklight(TEAL);
-   lcd.print(F("Set Kd"));
-
-   uint8_t buttons = 0;
-   while(true)
-   {
-      buttons = ReadButtons();
-      float increment = 0.01;
-      if (buttons & BUTTON_SHIFT)
-      {
-        increment *= 10;
-      }
-      if (buttons & BUTTON_LEFT)
-      {
-         opState = TUNE_I;
-         return;
-      }
-      if (buttons & BUTTON_RIGHT)
-      {
-         opState = RUN;
-         return;
-      }
-      if (buttons & BUTTON_UP)
-      {
-         Kd += increment;
-         delay(200);
-      }
-      if (buttons & BUTTON_DOWN)
-      {
-         Kd -= increment;
-         delay(200);
-      }
-      if ((millis() - lastInput) > 3000)  // return to RUN after 3 seconds idle
-      {
-         opState = RUN;
-         return;
-      }
-      lcd.setCursor(0,1);
-      lcd.print(Kd);
-      lcd.print(" ");
-      DoControl();
-   }
-}
-
-// ************************************************
-// PID COntrol State
-// SHIFT and RIGHT for autotune
-// RIGHT - Setpoint
-// LEFT - OFF
-// ************************************************
-void Run()
-{
-   // set up the LCD's number of rows and columns: 
-   lcd.print(F("Sp: "));
-   lcd.print(Setpoint);
-   lcd.write(1);
-   lcd.print(F("C : "));
-
-   SaveParameters();
-   myPID.SetTunings(Kp,Ki,Kd);
-
-   uint8_t buttons = 0;
-   while(true)
-   {
-      setBacklight();  // set backlight based on state
-
-      buttons = ReadButtons();
-      if ((buttons & BUTTON_SHIFT) 
-         && (buttons & BUTTON_RIGHT) 
-         && (abs(Input - Setpoint) < 0.5))  // Should be at steady-state
-      {
-         StartAutoTune();
-      }
-      else if (buttons & BUTTON_RIGHT)
-      {
-        opState = SETP;
-        return;
-      }
-      else if (buttons & BUTTON_LEFT)
-      {
-        opState = OFF;
-        return;
-      }
-      
-      DoControl();
-      
-      lcd.setCursor(0,1);
-      lcd.print(Input);
-      lcd.write(1);
-      lcd.print(F("C : "));
-      
-      float pct = map(Output, 0, WindowSize, 0, 1000);
-      lcd.setCursor(10,1);
-      lcd.print(F("      "));
-      lcd.setCursor(10,1);
-      lcd.print(pct/10);
-      //lcd.print(Output);
-      lcd.print("%");
-
-      lcd.setCursor(15,0);
-      if (tuning)
-      {
-        lcd.print("T");
-      }
-      else
-      {
-        lcd.print(" ");
-      }
-      
-      // periodically log to serial port in csv format
-      if (millis() - lastLogTime > logInterval)  
-      {
-        Serial.print(Input);
-        Serial.print(",");
-        Serial.println(Output);
-      }
-
-      delay(100);
-   }
-}
-
-// ************************************************
-// Execute the control loop
-// ************************************************
-void DoControl()
-{
-  // Read the input:
-  if (sensors.isConversionAvailable(0))
-  {
-    Input = sensors.getTempC(tempSensor);
-    sensors.requestTemperatures(); // prime the pump for the next one - but don't wait
-  }
-  
-  if (tuning) // run the auto-tuner
-  {
-     if (aTune.Runtime()) // returns 'true' when done
-     {
-        FinishAutoTune();
-     }
-  }
-  else // Execute control algorithm
-  {
-     myPID.Compute();
-  }
-  
-  // Time Proportional relay state is updated regularly via timer interrupt.
-  onTime = Output; 
+	// Time Proportional relay state is updated regularly via timer interrupt.
+	on_time = output; 
 }
 
 // ************************************************
 // Called by ISR every 15ms to drive the output
 // ************************************************
-void DriveOutput()
-{  
-  long now = millis();
-  // Set the output
-  // "on time" is proportional to the PID output
-  if(now - windowStartTime>WindowSize)
-  { //time to shift the Relay Window
-     windowStartTime += WindowSize;
-  }
-  if((onTime > 100) && (onTime > (now - windowStartTime)))
-  {
-     digitalWrite(RelayPin,HIGH);
-  }
-  else
-  {
-     digitalWrite(RelayPin,LOW);
-  }
-}
-
-// ************************************************
-// Set Backlight based on the state of control
-// ************************************************
-void setBacklight()
-{
-   if (tuning)
-   {
-      lcd.setBacklight(VIOLET); // Tuning Mode
-   }
-   else if (abs(Input - Setpoint) > 1.0)  
-   {
-      lcd.setBacklight(RED);  // High Alarm - off by more than 1 degree
-   }
-   else if (abs(Input - Setpoint) > 0.2)  
-   {
-      lcd.setBacklight(YELLOW);  // Low Alarm - off by more than 0.2 degrees
-   }
-   else
-   {
-      lcd.setBacklight(WHITE);  // We're on target!
-   }
+void drive_output() {  
+	long now = millis();
+	// Set the output
+	// "on time" is proportional to the PID output
+	if (now - window_start_time > window_size) { //time to shift the Relay Window
+		window_start_time += window_size;
+	}
+	digitalWrite(RELAY_PIN, !((on_time > 100) && (on_time > (now - window_start_time))));
 }
 
 // ************************************************
 // Start the Auto-Tuning cycle
 // ************************************************
+void start_auto_tune() {
+	// Remember the mode we were in
+	a_tune_mode_remember = pid.GetMode();
 
-void StartAutoTune()
-{
-   // REmember the mode we were in
-   ATuneModeRemember = myPID.GetMode();
-
-   // set up the auto-tune parameters
-   aTune.SetNoiseBand(aTuneNoise);
-   aTune.SetOutputStep(aTuneStep);
-   aTune.SetLookbackSec((int)aTuneLookBack);
-   tuning = true;
+	// set up the auto-tune parameters
+	a_tune.SetNoiseBand(auto_tune_noise);
+	a_tune.SetOutputStep(auto_tune_step);
+	a_tune.SetLookbackSec((int)auto_tune_lookback);
+	is_tuning = true;
 }
 
 // ************************************************
 // Return to normal control
 // ************************************************
-void FinishAutoTune()
-{
-   tuning = false;
+void finish_auto_tune() {
+	is_tuning = false;
 
-   // Extract the auto-tune calculated parameters
-   Kp = aTune.GetKp();
-   Ki = aTune.GetKi();
-   Kd = aTune.GetKd();
+	// Extract the auto-tune calculated parameters
+	kp = a_tune.GetKp();
+	ki = a_tune.GetKi();
+	kd = a_tune.GetKd();
 
-   // Re-tune the PID and revert to normal control mode
-   myPID.SetTunings(Kp,Ki,Kd);
-   myPID.SetMode(ATuneModeRemember);
-   
-   // Persist any changed parameters to EEPROM
-   SaveParameters();
-}
+	// Re-tune the PID and revert to normal control mode
+	pid.SetTunings(kp,ki,kd);
+	pid.SetMode(a_tune_mode_remember);
 
-// ************************************************
-// Check buttons and time-stamp the last press
-// ************************************************
-uint8_t ReadButtons()
-{
-  uint8_t buttons = lcd.readButtons();
-  if (buttons != 0)
-  {
-    lastInput = millis();
-  }
-  return buttons;
+	// Persist any changed parameters to EEPROM
+	save_parameters();
 }
 
 // ************************************************
 // Save any parameter changes to EEPROM
 // ************************************************
-void SaveParameters()
-{
-   if (Setpoint != EEPROM_readDouble(SpAddress))
-   {
-      EEPROM_writeDouble(SpAddress, Setpoint);
-   }
-   if (Kp != EEPROM_readDouble(KpAddress))
-   {
-      EEPROM_writeDouble(KpAddress, Kp);
-   }
-   if (Ki != EEPROM_readDouble(KiAddress))
-   {
-      EEPROM_writeDouble(KiAddress, Ki);
-   }
-   if (Kd != EEPROM_readDouble(KdAddress))
-   {
-      EEPROM_writeDouble(KdAddress, Kd);
-   }
+void save_parameters() {
+	eeprom_write_double(kp_address, kp);
+	eeprom_write_double(ki_address, ki);
+	eeprom_write_double(kd_address, kd);
 }
 
 // ************************************************
 // Load parameters from EEPROM
 // ************************************************
-void LoadParameters()
-{
-  // Load from EEPROM
-   Setpoint = EEPROM_readDouble(SpAddress);
-   Kp = EEPROM_readDouble(KpAddress);
-   Ki = EEPROM_readDouble(KiAddress);
-   Kd = EEPROM_readDouble(KdAddress);
-   
-   // Use defaults if EEPROM values are invalid
-   if (isnan(Setpoint))
-   {
-     Setpoint = 60;
-   }
-   if (isnan(Kp))
-   {
-     Kp = 850;
-   }
-   if (isnan(Ki))
-   {
-     Ki = 0.5;
-   }
-   if (isnan(Kd))
-   {
-     Kd = 0.1;
-   }  
+void load_parameters() {
+	// Load from EEPROM
+	kp = eeprom_read_double(kp_address);
+	ki = eeprom_read_double(ki_address);
+	kd = eeprom_read_double(kd_address);
+
+	// Use defaults if EEPROM values are invalid
+	if (isnan(kp)) {
+		kp = 850;
+		ki = 0.5;
+		kd = 0.1;
+	}  
 }
 
-
-// ************************************************
-// Write floating point values to EEPROM
-// ************************************************
-void EEPROM_writeDouble(int address, double value)
-{
-   byte* p = (byte*)(void*)&value;
-   for (int i = 0; i < sizeof(value); i++)
-   {
-      EEPROM.write(address++, *p++);
-   }
+void eeprom_write_double(int address, double value) {
+	// Write floating point values to EEPROM
+	byte* p = (byte*)(void*)&value;
+	for (int i = 0; i < sizeof(value); i++) {
+		EEPROM.write(address++, *p++);
+	}
 }
 
-// ************************************************
-// Read floating point values from EEPROM
-// ************************************************
-double EEPROM_readDouble(int address)
-{
-   double value = 0.0;
-   byte* p = (byte*)(void*)&value;
-   for (int i = 0; i < sizeof(value); i++)
-   {
-      *p++ = EEPROM.read(address++);
-   }
-   return value;
+double eeprom_read_double(int address) {
+	// Read floating point values from EEPROM
+	double value = 0.0;
+	byte* p = (byte*)(void*)&value;
+	for (int i = 0; i < sizeof(value); i++) {
+		*p++ = EEPROM.read(address++);
+	}
+	return value;
 }
