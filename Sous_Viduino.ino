@@ -37,6 +37,10 @@
 #define ONE_WIRE_PWR 6
 #define ONE_WIRE_BUS 7
 
+#define RISING 0
+#define FALLING 1
+#define STEADY 2
+
 // ************************************************
 // PID Variables and constants
 // ************************************************
@@ -48,6 +52,8 @@ double current_temperature = 0;
 bool is_on = false;
 bool is_on_selection = false;
 bool heat_active = false;
+bool heat_active_requested = false;
+unsigned long heat_last_changed;
 int turn_on_delay;
 int turn_off_delay;
 unsigned long started_cooking_at = 0;
@@ -55,11 +61,20 @@ unsigned long turn_on_at;
 unsigned long turn_off_at;
 
 // Temperature history
-#define HISTORY_LEN 60
-#define HISTORY_INTERVAL 10000
-byte history[HISTORY_LEN];
+#define HISTORY_LEN 90
+#define HISTORY_INTERVAL 3000
+double history[HISTORY_LEN];
+double current_avg;
 unsigned long last_history_update;
+unsigned long last_avg_update;
 volatile long on_time = 0;
+byte temp_direction = STEADY;
+
+String direction_strings[] = {
+	"Rising",
+	"Falling",
+	"Steady"
+};
 
 // ************************************************
 // Display / UI
@@ -70,15 +85,19 @@ ToggleItem *on_toggle = new ToggleItem("On");
 RangeItem *turn_on_delay_range = new RangeItem("On After", 0, 1440, 0, 30);
 RangeItem *turn_off_delay_range = new RangeItem("Off After", 0, 2880, 0, 5);
 RangeItem *temperature_range = new RangeItem("Temp", 0, 100, 58, 1);
+RangeItem *overshoot_range = new RangeItem("Overshoot", 0, 10, 2, 0.1);
+RangeItem *lookback_time = new RangeItem("Lookback", 0, 120, 30, 10);
 
 Item *items[] = {
 	on_toggle,
 	turn_on_delay_range,
 	turn_off_delay_range,
-	temperature_range
+	temperature_range,
+	overshoot_range,
+	lookback_time,
 };
 
-Screen *main_screen = new Screen(u8g, items, 4);
+Screen *main_screen = new Screen(u8g, items, 6);
 U8G_UI ui = U8G_UI(main_screen, UP_PIN, DOWN_PIN, SELECT_PIN);
 
 // ************************************************
@@ -101,6 +120,7 @@ void timer_isr() {
 void setup() {
 	// Initialize Relay Control:
 	pinMode(RELAY_PIN, OUTPUT);    // output mode to drive relay
+	digitalWrite(RELAY_PIN, HIGH); // Turn relay off to start
 
 	// Set up Ground & Power for the sensor from GPIO pins
 	pinMode(ONE_WIRE_GND, OUTPUT);
@@ -131,30 +151,49 @@ void update_history() {
 		for (byte i=1; i < HISTORY_LEN; i++) {
 			history[i-1] = history[i];
 		}
-		history[HISTORY_LEN-1] = int(round(current_temperature));
+		history[HISTORY_LEN-1] = current_avg;
 		last_history_update = now;
 	}
 }
 
-void draw_history() {
-	main_screen->write(String(current_temperature) + " deg", 64, 0, CENTER);
+double get_history_avg() {
+	double history_sum;
+	for (byte i=0; i < HISTORY_LEN; i++) {
+		history_sum += history[i];
+	}
+	return history_sum/HISTORY_LEN;
+}
 
+double temperature_seconds_ago(double seconds) {
+	double history_steps_ago = min(HISTORY_LEN - 2, int(round((1000*seconds)/HISTORY_INTERVAL)));
+	double between_frac = history_steps_ago - int(history_steps_ago);
+	int history_newer_index = HISTORY_LEN - 1 - int(history_steps_ago);
+	double history_newer = history[history_newer_index];
+	double history_older = history[history_newer_index - 1];
+
+	return history_older * between_frac + history_newer * (1.0 - between_frac);
+}
+
+void draw_history() {
+	main_screen->write(String(current_avg) + " deg", 64, 0, CENTER);
+	main_screen->write(direction_strings[temp_direction], 64, 10, CENTER);
 	// Draw horizontal dotted line for target temperature
 	byte y_pos_target_temperature = 73 - round(target_temperature / 2.0);
+	byte left_edge = 64 - HISTORY_LEN/2;
 	for (byte x=0; x < HISTORY_LEN; x+=2) {
-		u8g.drawPixel(x + 35, y_pos_target_temperature);
+		u8g.drawPixel(x + left_edge, y_pos_target_temperature);
 	}
 	main_screen->write(String(int(round(target_temperature))), 64, y_pos_target_temperature - 10, CENTER);
 
 	// Draw history lines, one line per entry
 	for (byte x=0; x < HISTORY_LEN; x++) {
-		u8g.drawLine(x + 34, 63, x + 34, 73 - round(history[x] / 2.0));
+		u8g.drawLine(x + left_edge, 63, x + left_edge, 73 - round(history[x] / 2.0));
 	}
 
 	byte y_pos_left = min(73 - round(history[0] / 2.0) - 4, 56);
-	byte y_pos_right = min(73 - round(history[59] / 2.0) - 4, 56);
-	main_screen->write(String(int(round(history[0]))), 33, y_pos_left, RIGHT);
-	main_screen->write(String(int(round(history[59]))), 96, y_pos_right, LEFT);
+	byte y_pos_right = min(73 - round(history[HISTORY_LEN - 1] / 2.0) - 4, 56);
+	main_screen->write(String(int(round(history[0]))), left_edge - 2, y_pos_left, RIGHT);
+	main_screen->write(String(int(round(history[HISTORY_LEN - 1]))), left_edge + HISTORY_LEN + 2, y_pos_right, LEFT);
 }
 
 void loop(){
@@ -162,7 +201,29 @@ void loop(){
 	if (sensors.isConversionAvailable(0)) {
 		current_temperature = sensors.getTempC(temp_sensor);
 		sensors.requestTemperatures(); // prime the pump for the next one - but don't wait
+
+		if(!current_avg) {
+			current_avg = current_temperature;
+		}
+
+		// Update the rolling average of current temperatures. This is recorded in a window of the same size as one 
+		// history entry - so everytime the history is updated, it'll be updated with the average temperature since the last history update.
+		unsigned long avg_frame_time = millis() - last_avg_update;
+		if (avg_frame_time > 100) {
+			last_avg_update = millis();
+			double avg_fraction = min(1.0, double(avg_frame_time) / HISTORY_INTERVAL);
+
+			current_avg = (1 - avg_fraction) * current_avg + avg_fraction * current_temperature;
+		}
 	}
+
+	// Set relay state
+	if (heat_active != heat_active_requested && millis() > heat_last_changed + 5000) {
+		heat_last_changed = millis();
+		digitalWrite(RELAY_PIN, !heat_active_requested);
+		heat_active = heat_active_requested;
+	}
+	digitalWrite(RELAY_PIN, !heat_active);
 
 	target_temperature = temperature_range->get_value();
 	turn_on_delay = turn_on_delay_range->get_value();
@@ -172,13 +233,12 @@ void loop(){
 	do {
 		if (digitalRead(BYPASS_PIN) == LOW) {
 			// Bypass logic - If bypass is on, nothing else happens
-			digitalWrite(RELAY_PIN, LOW);
+			heat_active_requested = true;
 
 			main_screen->write(String(int(round(current_temperature))) + " deg", 64, 0, CENTER);
 			u8g.setScale2x2(); 
 			main_screen->write("OFF", 32, 12, CENTER);
 			u8g.undoScale();
-			return;
 		} else if (millis() > ui.last_activity() + 2000) {
 			// Show status screen
 			draw_history();
@@ -186,6 +246,10 @@ void loop(){
 			ui.update();
 		}
 	} while(u8g.nextPage());
+
+	if (digitalRead(BYPASS_PIN) == LOW) {
+		return;
+	}
 
 	// When the on state changes in the menu, turn the cooking off or set the on-delay
 	if (on_toggle->get_value() != is_on_selection) {
@@ -224,16 +288,47 @@ void loop(){
 			}
 		}
 
-		// Turn the relay on if it needs to be 
-		// We use a simple hysteresis to avoid too much turning on or off
-		if (current_temperature < (target_temperature - 0.5)) {
-			digitalWrite(RELAY_PIN, LOW);
-		} else if (current_temperature >= target_temperature) {
-			digitalWrite(RELAY_PIN, HIGH);
+		double temp_old = temperature_seconds_ago(lookback_time->get_value());
+		if(current_avg > temp_old + 0.1) {
+			temp_direction = RISING;
+		} else if (current_avg < temp_old - 0.1) {
+			temp_direction = FALLING;
+		} else {
+			temp_direction = STEADY;
+		}
+
+		// Turn the relay on if it needs to be.
+		if (current_avg < (target_temperature - overshoot_range->get_value())) {
+			// The temperature is low - turn on the heat.
+			heat_active_requested = true;
+		} else if (current_avg > target_temperature) {
+			// The temperature is higher than the target - turn off the heat.
+			heat_active_requested = false;
+		} else if (temp_direction == RISING) {
+			// Temperature is rising and we're approaching the target, cut off now to account for overshoot.
+			heat_active_requested = false;
+		} else if (temp_direction == FALLING) {
+			// The temperature is falling and we're lower than the target, turn on the heat.
+			heat_active_requested = true;
+		} else {
+			// This case only gets called if the temperature is reasonable steady and it's below the target
+			if (current_avg < target_temperature - 0.5) {
+				heat_active_requested = true;
+			} else {
+				// Do some fine-tuning. Turn the relay on if the current temperature is even slightly less than a recent temperature
+				if (current_avg < temp_old) {
+					// Super lazy 50% duty cycle hackery.
+					if (millis() - heat_last_changed > 5000) {
+						heat_active_requested = !heat_active_requested;
+					}
+				} else {
+					heat_active_requested = false;
+				}
+			}
 		}
 	} else {
 		// Turn the relay off
-		digitalWrite(RELAY_PIN, HIGH);
+		heat_active_requested = false;
 	}
 
 	update_history();
